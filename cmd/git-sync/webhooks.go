@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -25,6 +26,18 @@ type Webhook struct {
 	Success *int `json:"success"`
 	// Timeout for the http/s request
 	Timeout time.Duration `json:"timeout"`
+}
+
+func (w *Webhook) UnmarshalJSON(data []byte) error {
+	type testAlias Webhook
+	test := &testAlias{
+		Timeout: time.Second * 5,
+	}
+
+	_ = json.Unmarshal(data, test)
+
+	*w = Webhook(*test)
+	return nil
 }
 
 func (w *Webhook) Do() error {
