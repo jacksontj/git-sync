@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,6 +37,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/thockin/glogr"
 	"github.com/thockin/logr"
 )
@@ -59,7 +63,7 @@ var flSyncTimeout = flag.Int("timeout", envInt("GIT_SYNC_TIMEOUT", 120),
 var flOneTime = flag.Bool("one-time", envBool("GIT_SYNC_ONE_TIME", false),
 	"exit after the initial checkout")
 var flMaxSyncFailures = flag.Int("max-sync-failures", envInt("GIT_SYNC_MAX_SYNC_FAILURES", 0),
-	"the number of consecutive failures allowed before aborting (the first pull must succeed)")
+	"the number of consecutive failures allowed before aborting (the first pull must succeed, <0 allows for infinite failures)")
 var flChmod = flag.Int("change-permissions", envInt("GIT_SYNC_PERMISSIONS", 0),
 	"the file permissions to apply to the checked-out files")
 
@@ -73,8 +77,12 @@ var flPassword = flag.String("password", envString("GIT_SYNC_PASSWORD", ""),
 
 var flSSH = flag.Bool("ssh", envBool("GIT_SYNC_SSH", false),
 	"use SSH for git operations")
+var flSSHSecret = flag.String("ssh-key", envString("GIT_SSH_KEY", "/etc/git-secret/ssh"),
+	"the ssh key to use")
 var flSSHKnownHosts = flag.Bool("ssh-known-hosts", envBool("GIT_KNOWN_HOSTS", true),
 	"enable SSH known_hosts verification")
+var flSSHKnownHostsFile = flag.String("ssh-known-hosts-file", envString("GIT_KNOWN_HOSTS_FILE", "/etc/git-secret/known_hosts"),
+	"the known hosts file to use")
 
 var flCookieFile = flag.Bool("cookie-file", envBool("GIT_COOKIE_FILE", false),
 	"use git cookiefile")
@@ -82,7 +90,29 @@ var flCookieFile = flag.Bool("cookie-file", envBool("GIT_COOKIE_FILE", false),
 var flGitCmd = flag.String("git", envString("GIT_SYNC_GIT", "git"),
 	"the git command to run (subject to PATH search)")
 
+var flHTTPBind = flag.String("http-bind", envString("GIT_SYNC_HTTP_BIND", ""),
+	"the bind address for git-sync's HTTP endpoint")
+
 var log = newLoggerOrDie()
+
+// Total pull/error, summary on pull duration
+var (
+	// TODO: have a marker for "which" servergroup
+	syncDuration = prometheus.NewSummaryVec(prometheus.SummaryOpts{
+		Name: "git_sync_duration_seconds",
+		Help: "Summary of git_sync durations",
+	}, []string{"status"})
+
+	syncCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "git_sync_count_total",
+		Help: "How many git syncs completed, partitioned by success",
+	}, []string{"status"})
+)
+
+func init() {
+	prometheus.MustRegister(syncDuration)
+	prometheus.MustRegister(syncCount)
+}
 
 func newLoggerOrDie() logr.Logger {
 	g, err := glogr.New()
@@ -192,6 +222,17 @@ func main() {
 		}
 	}
 
+	if *flHTTPBind != "" {
+		ln, err := net.Listen("tcp", *flHTTPBind)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: unable to bind HTTP endpoint: %v\n", err)
+		}
+		go func() {
+			http.Handle("/metrics", promhttp.Handler())
+			http.Serve(ln, http.DefaultServeMux)
+		}()
+	}
+
 	// From here on, output goes through logging.
 	log.V(0).Infof("starting up: %q", os.Args)
 
@@ -201,9 +242,12 @@ func main() {
 	initialSync := true
 	failCount := 0
 	for {
+		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*flSyncTimeout))
 		if err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest); err != nil {
-			if initialSync || failCount >= *flMaxSyncFailures {
+			syncDuration.WithLabelValues("error").Observe(time.Now().Sub(start).Seconds())
+			syncCount.WithLabelValues("error").Inc()
+			if initialSync || (*flMaxSyncFailures >= 0 && failCount >= *flMaxSyncFailures) {
 				log.Errorf("error syncing repo: %v", err)
 				os.Exit(1)
 			}
@@ -215,6 +259,9 @@ func main() {
 			time.Sleep(waitTime(*flWait))
 			continue
 		}
+		syncDuration.WithLabelValues("success").Observe(time.Now().Sub(start).Seconds())
+		syncCount.WithLabelValues("success").Inc()
+
 		if initialSync {
 			if *flOneTime {
 				os.Exit(0)
@@ -530,8 +577,8 @@ func setupGitAuth(username, password, gitURL string) error {
 func setupGitSSH(setupKnownHosts bool) error {
 	log.V(1).Infof("setting up git SSH credentials")
 
-	var pathToSSHSecret = "/etc/git-secret/ssh"
-	var pathToSSHKnownHosts = "/etc/git-secret/known_hosts"
+	var pathToSSHSecret = *flSSHSecret
+	var pathToSSHKnownHosts = *flSSHKnownHostsFile
 
 	fileInfo, err := os.Stat(pathToSSHSecret)
 	if err != nil {
