@@ -237,14 +237,15 @@ func main() {
 	log.V(0).Infof("starting up: %q", os.Args)
 
 	// Startup webhooks goroutine
-	go ServeWebhooks()
+	webhookTriggerChan := make(chan struct{})
+	go ServeWebhooks(webhookTriggerChan)
 
 	initialSync := true
 	failCount := 0
 	for {
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*flSyncTimeout))
-		if err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest); err != nil {
+		if changed, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest); err != nil {
 			syncDuration.WithLabelValues("error").Observe(time.Now().Sub(start).Seconds())
 			syncCount.WithLabelValues("error").Inc()
 			if initialSync || (*flMaxSyncFailures >= 0 && failCount >= *flMaxSyncFailures) {
@@ -258,6 +259,9 @@ func main() {
 			cancel()
 			time.Sleep(waitTime(*flWait))
 			continue
+		} else if changed {
+			// Trigger webhooks to be called
+			webhookTriggerChan <- struct{}{}
 		}
 		syncDuration.WithLabelValues("success").Observe(time.Now().Sub(start).Seconds())
 		syncCount.WithLabelValues("success").Inc()
@@ -346,9 +350,6 @@ func updateSymlink(ctx context.Context, gitRoot, link, newDir string) error {
 
 		log.V(1).Infof("pruned old worktrees")
 	}
-
-	// Trigger webhooks to be called
-	WebhookCallTriggerChannel <- struct{}{}
 
 	return nil
 }
@@ -450,7 +451,8 @@ func revIsHash(ctx context.Context, rev, gitRoot string) (bool, error) {
 }
 
 // syncRepo syncs the branch of a given repository to the destination at the given rev.
-func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string) error {
+// returns (1) whether a change occured and (2) an error if one happened
+func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string) (bool, error) {
 	target := path.Join(gitRoot, dest)
 	gitRepoPath := path.Join(target, ".git")
 	hash := rev
@@ -459,18 +461,18 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 	case os.IsNotExist(err):
 		err = cloneRepo(ctx, repo, branch, rev, depth, gitRoot)
 		if err != nil {
-			return err
+			return false, err
 		}
 		hash, err = hashForRev(ctx, rev, gitRoot)
 		if err != nil {
-			return err
+			return false, err
 		}
 	case err != nil:
-		return fmt.Errorf("error checking if repo exists %q: %v", gitRepoPath, err)
+		return false, fmt.Errorf("error checking if repo exists %q: %v", gitRepoPath, err)
 	default:
 		local, remote, err := getRevs(ctx, target, branch, rev)
 		if err != nil {
-			return err
+			return false, err
 		}
 		log.V(2).Infof("local hash:  %s", local)
 		log.V(2).Infof("remote hash: %s", remote)
@@ -479,11 +481,11 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 			hash = remote
 		} else {
 			log.V(1).Infof("no update required")
-			return nil
+			return false, nil
 		}
 	}
 
-	return addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, hash)
+	return true, addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, hash)
 }
 
 // getRevs returns the local and upstream hashes for rev.
